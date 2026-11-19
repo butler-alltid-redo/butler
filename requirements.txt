@@ -1,0 +1,13 @@
+faster-whisper 
+pyaudio 
+numpy
+scipy
+openai
+silero-vad
+pydantic-ai
+pyobjc-framework-Quartz
+
+# development dependencies
+ruff
+ty
+uv
