@@ -28,17 +28,20 @@ def load_whisper_model(
 def load_vad(
     target_rate: int,
     silence_duration_ms: int,
+    threshold: float = 0.75,
 ) -> VADIterator:
     """Load Silero voice activity detection with sentence timing defaults.
 
     Args:
         target_rate: Audio sample rate consumed by the VAD.
         silence_duration_ms: Silence duration that ends an active utterance.
+        threshold: Speech probability required to enter voice activity state.
     """
     print("Loading Silero VAD...")
     torch.set_num_threads(1)
     vad = VADIterator(
         load_silero_vad(),
+        threshold=threshold,
         sampling_rate=target_rate,
         min_silence_duration_ms=silence_duration_ms,
         speech_pad_ms=300,

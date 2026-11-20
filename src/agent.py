@@ -45,13 +45,15 @@ STT_INPUT_DEVICE = "BlackHole 16ch"
 SOURCE_RATE, TARGET_RATE = 48000, 16000
 CHANNELS, FRAMES_PER_READ = 2, 1536
 SILENCE_MS, PRE_ROLL, MAX_UTTERANCE = 1000, 10, 120
+VAD_THRESHOLD = 0.75
+SPEECH_CONFIRM_MS = 350
 
 # LLM
 KEEP_ALIVE = "240h"
 
 # TTS
 TTS_OUTPUT_DEVICE = "BlackHole 2ch"
-CHUNK_PUNCTUATION = re.compile(r"[.!?]")
+CHUNK_PUNCTUATION = re.compile(r"[.!?]+")
 tts_queue: queue.Queue[str | None] = queue.Queue()
 playback_queue: queue.Queue[np.ndarray | None] = queue.Queue()
 playback_done = threading.Event()
@@ -65,7 +67,7 @@ tts_generation = 0
 
 # Initialize models and clients
 whisper = load_whisper_model()
-vad = load_vad(TARGET_RATE, SILENCE_MS)
+vad = load_vad(TARGET_RATE, SILENCE_MS, threshold=VAD_THRESHOLD)
 tts_model = load_tts_model()
 
 # Use Ollama's OpenAI-compatible API while letting Pydantic AI retain the
@@ -78,7 +80,10 @@ ollama_provider = OpenAICompatibleProvider(
 
 
 def split_stream_chunks(text: str, pending: str = "") -> tuple[list[str], str]:
-    """Split delta text into complete punctuation-delimited speech chunks.
+    """Split delta text into punctuation-delimited speech chunks.
+
+    Adjacent punctuation marks such as ``...``, ``?!``, and ``!!`` are kept
+    together as one boundary instead of creating a separate chunk for each mark.
 
     Args:
         text: A newly received LLM text delta.
@@ -260,6 +265,7 @@ def agent():
             "frames_per_read": FRAMES_PER_READ,
             "pre_roll_chunks": PRE_ROLL,
             "max_utterance_seconds": MAX_UTTERANCE,
+            "speech_confirm_ms": SPEECH_CONFIRM_MS,
             "on_speech_start": interrupt_assistant,
         },
         daemon=True,

@@ -21,6 +21,7 @@ def capture_audio(
     frames_per_read: int,
     pre_roll_chunks: int,
     max_utterance_seconds: int,
+    speech_confirm_ms: int = 350,
     on_speech_start: Callable[[], None] | None = None,
 ) -> None:
     """Capture speech until silence or the maximum utterance length is reached.
@@ -36,11 +37,18 @@ def capture_audio(
         frames_per_read: Number of source frames read per loop iteration.
         pre_roll_chunks: Number of recent chunks retained before speech begins.
         max_utterance_seconds: Maximum duration of one captured utterance.
+        speech_confirm_ms: Sustained speech required before a start callback fires.
         on_speech_start: Optional callback invoked immediately when VAD detects speech.
     """
     pre_roll = []
     recording = []
     is_recording = False
+    is_confirming = False
+    confirmation_chunks = []
+    speech_confirm_chunks = max(
+        1,
+        int(speech_confirm_ms * target_rate / 1000 / 512),
+    )
     max_chunks = int(max_utterance_seconds * target_rate / 512)
 
     try:
@@ -56,17 +64,31 @@ def capture_audio(
             with torch.inference_mode():
                 event = vad(torch.from_numpy(audio))
 
-            if not is_recording:
+            if not is_recording and not is_confirming:
                 pre_roll.append(audio.copy())
                 pre_roll = pre_roll[-pre_roll_chunks:]
 
                 if event and "start" in event:
+                    recording = pre_roll.copy()
+                    pre_roll.clear()
+                    is_confirming = True
+                    confirmation_chunks = [audio.copy()]
+            elif is_confirming:
+                confirmation_chunks.append(audio.copy())
+
+                if len(confirmation_chunks) >= speech_confirm_chunks:
                     print("\nSpeech detected...")
                     if on_speech_start is not None:
                         on_speech_start()
-                    recording = pre_roll.copy()
-                    pre_roll.clear()
+                    recording.extend(confirmation_chunks)
+                    confirmation_chunks = []
+                    is_confirming = False
                     is_recording = True
+                elif event and "end" in event:
+                    recording = []
+                    confirmation_chunks = []
+                    is_confirming = False
+                    vad.reset_states()
             else:
                 recording.append(audio.copy())
 
