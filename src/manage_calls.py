@@ -3,7 +3,7 @@
 import threading
 import time
 
-from agent import agent, interrupt_assistant
+from agent import AgentSession, agent, interrupt_assistant
 from signal_utils import (
     answer_call,
     clear_log_file,
@@ -13,16 +13,15 @@ from signal_utils import (
 )
 
 
-def monitor_call_termination(stop_event=None):
+def monitor_call_termination(session):
     """Stop the active agent when Signal reports call termination."""
-    if stop_event is None:
-        stop_event = threading.Event()
+    stop_event = session.stop_event
 
     while not stop_event.is_set():
         if detect_terminated_call():
             print("Call terminated.")
             stop_event.set()
-            interrupt_assistant()
+            interrupt_assistant(session)
             return
         time.sleep(1)
 
@@ -46,16 +45,18 @@ def main():
             print("Call answered. Log file cleared.")
             last_answered_datetime = answered_datetime
 
-            stop_event = threading.Event()
+            session = AgentSession()
             termination_thread = threading.Thread(
                 target=monitor_call_termination,
-                args=(stop_event,),
+                args=(session,),
                 name="call-termination-monitor",
                 daemon=True,
             )
             termination_thread.start()
 
-            agent(stop_event)
+            agent(session)
+
+            print("Call ended. Resuming monitoring for incoming calls...")
 
         time.sleep(1)
 

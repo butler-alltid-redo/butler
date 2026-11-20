@@ -9,6 +9,7 @@ can continue without waiting for playback.
 import queue
 import re
 import threading
+from dataclasses import dataclass, field
 
 import numpy as np
 import pyaudio
@@ -54,16 +55,28 @@ KEEP_ALIVE = "240h"
 # TTS
 TTS_OUTPUT_DEVICE = "BlackHole 2ch"
 CHUNK_PUNCTUATION = re.compile(r"[.!?]+")
-tts_queue: queue.Queue[str | None] = queue.Queue()
-playback_queue: queue.Queue[np.ndarray | None] = queue.Queue()
-playback_done = threading.Event()
-playback_stream: sd.OutputStream | None = None
-playback_audio: np.ndarray | None = None
-playback_lock = threading.Lock()
-interruption_event = threading.Event()
-active_cancellation_lock = threading.Lock()
-active_cancellation_token: CancellationToken | None = None
-tts_generation = 0
+
+
+@dataclass
+class AgentSession:
+    """Per-call state shared by the capture, LLM, and TTS workers."""
+
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    audio_queue: queue.Queue[np.ndarray | None] = field(default_factory=queue.Queue)
+    tts_queue: queue.Queue[str | None] = field(default_factory=queue.Queue)
+    playback_queue: queue.Queue[np.ndarray | None] = field(default_factory=queue.Queue)
+    playback_done: threading.Event = field(default_factory=threading.Event)
+    audio: pyaudio.PyAudio | None = None
+    input_stream: pyaudio.Stream | None = None
+    capture_thread: threading.Thread | None = None
+    tts_thread: threading.Thread | None = None
+    playback_stream: sd.OutputStream | None = None
+    playback_audio: np.ndarray | None = None
+    playback_lock: threading.Lock = field(default_factory=threading.Lock)
+    interruption_event: threading.Event = field(default_factory=threading.Event)
+    active_cancellation_lock: threading.Lock = field(default_factory=threading.Lock)
+    active_cancellation_token: CancellationToken | None = None
+    tts_generation: int = 0
 
 # Initialize models and clients
 whisper = load_whisper_model()
@@ -104,10 +117,10 @@ def split_stream_chunks(text: str, pending: str = "") -> tuple[list[str], str]:
     return chunks, pending
 
 
-def speak(text: str) -> None:
+def speak(text: str, session: AgentSession) -> None:
     """Queue text for synthesis without blocking the LLM stream."""
-    if not interruption_event.is_set():
-        tts_queue.put(text)
+    if not session.interruption_event.is_set():
+        session.tts_queue.put(text)
 
 
 def clear_queue(item_queue: queue.Queue) -> None:
@@ -116,26 +129,25 @@ def clear_queue(item_queue: queue.Queue) -> None:
         item_queue.queue.clear()
 
 
-def interrupt_assistant() -> None:
+def interrupt_assistant(session: AgentSession) -> None:
     """Cancel active LLM generation and discard all pending TTS/playback."""
-    global playback_audio, tts_generation
+    session.interruption_event.set()
+    session.tts_generation += 1
+    clear_queue(session.tts_queue)
+    clear_queue(session.playback_queue)
 
-    interruption_event.set()
-    tts_generation += 1
-    clear_queue(tts_queue)
-    clear_queue(playback_queue)
+    with session.playback_lock:
+        session.playback_audio = None
 
-    with playback_lock:
-        playback_audio = None
-
-    with active_cancellation_lock:
-        token = active_cancellation_token
+    with session.active_cancellation_lock:
+        token = session.active_cancellation_token
 
     if token is not None and not token.cancelled:
         token.cancel()
 
 
 def playback_callback(
+    session: AgentSession,
     outdata: np.ndarray,
     frames: int,
     _time,
@@ -146,66 +158,64 @@ def playback_callback(
     The callback silently fills any remaining frames when synthesis or queued
     audio is temporarily unavailable.  It never blocks the audio thread.
     """
-    global playback_audio
-
-    with playback_lock:
+    with session.playback_lock:
         outdata.fill(0)
         written = 0
 
         while written < frames:
-            if playback_audio is None:
+            if session.playback_audio is None:
                 try:
-                    playback_audio = playback_queue.get_nowait()
+                    session.playback_audio = session.playback_queue.get_nowait()
                 except queue.Empty:
                     break
 
-                if playback_audio is None:
-                    playback_done.set()
-                    playback_audio = None
+                if session.playback_audio is None:
+                    session.playback_done.set()
+                    session.playback_audio = None
                     break
 
             remaining = frames - written
-            available = len(playback_audio) - 0
+            available = len(session.playback_audio)
             count = min(remaining, available)
-            outdata[written : written + count] = playback_audio[:count]
+            outdata[written : written + count] = session.playback_audio[:count]
 
-            if count == len(playback_audio):
-                playback_audio = None
+            if count == len(session.playback_audio):
+                session.playback_audio = None
             else:
-                playback_audio = playback_audio[count:]
+                session.playback_audio = session.playback_audio[count:]
 
             written += count
 
 
-def tts_worker() -> None:
+def tts_worker(session: AgentSession) -> None:
     """Synthesize queued text and append its audio to the FIFO playback queue."""
-    global playback_stream
-
-    while (text := tts_queue.get()) is not None:
-        generation = tts_generation
+    while (text := session.tts_queue.get()) is not None:
+        generation = session.tts_generation
         for result in tts_model.generate(
             text=text,
             ref_audio="gago.wav",
             ref_text="Jag kommer aldrig att glömma hur det ojämna jordgolvet skavde mot mina bara knän.",
         ):
-            if generation != tts_generation:
+            if generation != session.tts_generation:
                 break
             samples = to_sounddevice_audio(result.audio)
-            if playback_stream is None:
-                playback_stream = sd.OutputStream(
+            if session.playback_stream is None:
+                session.playback_stream = sd.OutputStream(
                     samplerate=result.sample_rate,
                     channels=2,
                     dtype=np.float32,
                     device=TTS_OUTPUT_DEVICE,
-                    callback=playback_callback,
+                    callback=lambda *args, _session=session: playback_callback(
+                        _session, *args
+                    ),
                 )
-                playback_stream.start()
-            playback_queue.put(samples)
-        tts_queue.task_done()
+                session.playback_stream.start()
+            session.playback_queue.put(samples)
+        session.tts_queue.task_done()
 
-    playback_queue.put(None)
-    if playback_stream is None:
-        playback_done.set()
+    session.playback_queue.put(None)
+    if session.playback_stream is None:
+        session.playback_done.set()
 
 
 def transcribe_utterance(audio_data: np.ndarray) -> str:
@@ -254,7 +264,7 @@ def stream_assistant_response(
     prompt: str,
     conversation_history: list[ModelMessage] | None,
     output_label: str,
-    stop_event: threading.Event | None = None,
+    session: AgentSession,
 ) -> list[ModelMessage] | None:
     """Stream one agent response to text, TTS chunks, and message history.
 
@@ -267,13 +277,11 @@ def stream_assistant_response(
     Returns:
         Updated message history unless the response was interrupted.
     """
-    global active_cancellation_token
-
-    interruption_event.clear()
+    session.interruption_event.clear()
     cancellation_token = CancellationToken()
 
-    with active_cancellation_lock:
-        active_cancellation_token = cancellation_token
+    with session.active_cancellation_lock:
+        session.active_cancellation_token = cancellation_token
 
     try:
         with assistant.run_stream_sync(
@@ -285,10 +293,8 @@ def stream_assistant_response(
             print(f"{output_label}: ", end="", flush=True)
 
             for delta in result.stream_text(delta=True, debounce_by=None):
-                if interruption_event.is_set() or (
-                    stop_event is not None and stop_event.is_set()
-                ):
-                    if stop_event is not None and stop_event.is_set():
+                if session.interruption_event.is_set() or session.stop_event.is_set():
+                    if session.stop_event.is_set():
                         cancellation_token.cancel()
                     break
 
@@ -296,23 +302,19 @@ def stream_assistant_response(
                 chunks, pending = split_stream_chunks(delta, pending)
 
                 for chunk in chunks:
-                    if interruption_event.is_set() or (
-                        stop_event is not None and stop_event.is_set()
-                    ):
+                    if session.interruption_event.is_set() or session.stop_event.is_set():
                         break
-                    speak(chunk)
+                    speak(chunk, session)
 
             if (
                 pending.strip()
-                and not interruption_event.is_set()
-                and not (stop_event is not None and stop_event.is_set())
+                and not session.interruption_event.is_set()
+                and not session.stop_event.is_set()
             ):
-                speak(pending.strip())
+                speak(pending.strip(), session)
 
             print()
-            if not interruption_event.is_set() and not (
-                stop_event is not None and stop_event.is_set()
-            ):
+            if not session.interruption_event.is_set() and not session.stop_event.is_set():
                 return result.all_messages()
 
     except RunCancelled:
@@ -320,14 +322,14 @@ def stream_assistant_response(
     except RuntimeError as error:
         print(f"{output_label} error: {error}")
     finally:
-        with active_cancellation_lock:
-            if active_cancellation_token is cancellation_token:
-                active_cancellation_token = None
+        with session.active_cancellation_lock:
+            if session.active_cancellation_token is cancellation_token:
+                session.active_cancellation_token = None
 
     return conversation_history
 
 
-def agent(stop_event: threading.Event | None = None):
+def agent(session: AgentSession | None = None):
     """Run the interactive voice-assistant loop until interrupted.
 
     Captures utterances, transcribes them, streams LLM responses, and queues
@@ -335,13 +337,14 @@ def agent(stop_event: threading.Event | None = None):
     history across utterances.
 
     Args:
-        stop_event: Optional event set when the active call terminates.
+        session: Per-call state; a new session is created when omitted.
 
     Raises:
         RuntimeError: If the configured BlackHole input device is unavailable.
     """
-    if stop_event is None:
-        stop_event = threading.Event()
+    if session is None:
+        session = AgentSession()
+    stop_event = session.stop_event
 
     agent = Agent(
         OpenAIChatModel(OLLAMA_MODEL, provider=ollama_provider),
@@ -358,7 +361,8 @@ def agent(stop_event: threading.Event | None = None):
     )
 
     # Initialize audio
-    audio = pyaudio.PyAudio()
+    session.audio = pyaudio.PyAudio()
+    audio = session.audio
     input_device_index = next(
         (
             index
@@ -375,7 +379,7 @@ def agent(stop_event: threading.Event | None = None):
             f"'{STT_INPUT_DEVICE}'."
         )
 
-    stream = audio.open(
+    session.input_stream = audio.open(
         format=pyaudio.paFloat32,
         channels=CHANNELS,
         rate=SOURCE_RATE,
@@ -383,11 +387,10 @@ def agent(stop_event: threading.Event | None = None):
         input_device_index=input_device_index,
         frames_per_buffer=FRAMES_PER_READ,
     )
+    stream = session.input_stream
+    audio_queue = session.audio_queue
 
-    audio_queue = queue.Queue()
-    stop_event = threading.Event()
-
-    capture_thread = threading.Thread(
+    session.capture_thread = threading.Thread(
         target=capture_audio,
         args=(stream, vad, audio_queue, stop_event),
         kwargs={
@@ -398,14 +401,18 @@ def agent(stop_event: threading.Event | None = None):
             "pre_roll_chunks": PRE_ROLL,
             "max_utterance_seconds": MAX_UTTERANCE,
             "speech_confirm_ms": SPEECH_CONFIRM_MS,
-            "on_speech_start": interrupt_assistant,
+            "on_speech_start": lambda: interrupt_assistant(session),
         },
         daemon=True,
     )
 
-    capture_thread.start()
-    tts_thread = threading.Thread(target=tts_worker, daemon=True)
-    tts_thread.start()
+    session.capture_thread.start()
+    session.tts_thread = threading.Thread(
+        target=tts_worker,
+        args=(session,),
+        daemon=True,
+    )
+    session.tts_thread.start()
 
     try:
         print(f"Listening via {STT_INPUT_DEVICE} (device {input_device_index})...")
@@ -415,7 +422,7 @@ def agent(stop_event: threading.Event | None = None):
             greeting_prompt,
             conversation_history,
             "Greeting",
-            stop_event,
+            session,
         )
 
         while not stop_event.is_set():
@@ -437,7 +444,7 @@ def agent(stop_event: threading.Event | None = None):
                 transcript,
                 conversation_history,
                 "LLM",
-                stop_event,
+                session,
             )
 
     except KeyboardInterrupt:
@@ -445,18 +452,25 @@ def agent(stop_event: threading.Event | None = None):
 
     finally:
         stop_event.set()
-        capture_thread.join(timeout=3)
-        tts_queue.put(None)
-        tts_thread.join()
-        playback_done.wait(timeout=30)
+        if session.capture_thread is not None:
+            session.capture_thread.join(timeout=3)
+        session.tts_queue.put(None)
+        if session.tts_thread is not None:
+            session.tts_thread.join()
+        session.playback_done.wait(timeout=30)
 
-        if playback_stream is not None:
-            playback_stream.stop()
-            playback_stream.close()
+        if session.playback_stream is not None:
+            session.playback_stream.stop()
+            session.playback_stream.close()
+            session.playback_stream = None
 
-        if stream.is_active():
-            stream.stop_stream()
+        if session.input_stream is not None:
+            if session.input_stream.is_active():
+                session.input_stream.stop_stream()
+            session.input_stream.close()
+            session.input_stream = None
 
-        stream.close()
-        audio.terminate()
+        if session.audio is not None:
+            session.audio.terminate()
+            session.audio = None
         print("Stopped.")
