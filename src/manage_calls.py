@@ -1,5 +1,7 @@
+import threading
 import time
 
+from agent import agent
 from signal_utils import (
     answer_call,
     clear_log_file,
@@ -7,6 +9,14 @@ from signal_utils import (
     detect_terminated_call,
     get_last_log_line_datetime,
 )
+
+
+def monitor_call_termination():
+    while True:
+        if detect_terminated_call():
+            print("Call terminated.")
+            return
+        time.sleep(1)
 
 
 def main():
@@ -27,14 +37,15 @@ def main():
             print("Call answered. Log file cleared.")
             last_answered_datetime = answered_datetime
 
-            # TODO: Start an agent session with STT+LLM+TTS. End the session if the call is terminated.
+            # TODO If call is terminated, stop the agent and return to monitoring for incoming calls.
+            # termination_thread = threading.Thread(
+            #     target=monitor_call_termination,
+            #     name="call-termination-monitor",
+            #     daemon=True,
+            # )
+            # termination_thread.start()
 
-            # Check if call is terminated
-            while True:
-                if detect_terminated_call():
-                    print("Call terminated.")
-                    break
-                time.sleep(1)  # Check for call termination every second
+            agent()
 
         time.sleep(1)
 

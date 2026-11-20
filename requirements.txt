@@ -6,6 +6,8 @@ openai
 silero-vad
 pydantic-ai
 pyobjc-framework-Quartz
+ipynb
+sounddevice
 
 # development dependencies
 ruff
