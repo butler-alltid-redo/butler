@@ -1,3 +1,9 @@
+"""macOS automation and Signal log parsing helpers.
+
+These helpers activate Signal, dispatch call shortcuts, read log timestamps,
+and detect incoming or terminated calls.
+"""
+
 import os
 import re
 import subprocess
@@ -11,6 +17,7 @@ import Quartz
 
 
 def get_signal_window_bounds():
+    """Return the position and size of the current Signal window."""
     script = """
     tell application "System Events"
         tell process "Signal"
@@ -25,6 +32,7 @@ def get_signal_window_bounds():
 
 
 def hardware_click(x: float, y: float):
+    """Move the pointer and perform a physical-style mouse click at a position."""
     point = (x, y)
     # Move cursor first so hover state registers in Electron
     move = Quartz.CGEventCreateMouseEvent(  # ty: ignore[missing-attribute]
@@ -53,6 +61,7 @@ def hardware_click(x: float, y: float):
 
 
 def make_call():
+    """Open Signal and start a call using keyboard and mouse automation."""
     # Use AppleScript and Quartz to perform the following actions:
     # 1. Activate the Signal app
     # 2. Select first contact by pressing `Cmd+1`
@@ -83,6 +92,7 @@ def make_call():
 
 
 def answer_call():
+    """Activate Signal and dispatch the configured answer-call shortcut."""
     # Use AppleScript and Quartz to perform the following actions:
     # 1. Activate the Signal app
     # 2. Click `Cmd+Shift+A` to answer the call
@@ -108,6 +118,7 @@ datetime_regexp = r'"time":"([^"]+)"'
 
 
 def get_datetime_from_log_line(line: str) -> datetime:
+    """Extract and parse the ISO timestamp from one Signal log line."""
     match = re.search(datetime_regexp, line)
     if match is not None:
         return datetime.fromisoformat(match.group(1))
@@ -116,6 +127,17 @@ def get_datetime_from_log_line(line: str) -> datetime:
 
 
 def get_last_log_line_datetime(lines: list[str] | None = None) -> datetime:
+    """Read the latest timestamp from the Signal log.
+
+    Args:
+        lines: Optional preloaded log lines; otherwise the configured log is read.
+
+    Returns:
+        The latest ISO timestamp, or ``datetime.min`` in UTC for an empty log.
+
+    Raises:
+        FileNotFoundError: If the Signal log is missing.
+    """
     try:
         if lines is None:
             with open(os.path.expanduser(SIGNAL_LOG_PATH), "r") as f:
@@ -129,6 +151,7 @@ def get_last_log_line_datetime(lines: list[str] | None = None) -> datetime:
 
 
 def clear_log_file():
+    """Clear the Signal log after an incoming call has been handled."""
     with open(os.path.expanduser(SIGNAL_LOG_PATH), "w") as f:
         f.write("")
 
@@ -137,10 +160,17 @@ def detect_incoming_call(
     last_answered_datetime: datetime | None,
     final_line_datetime_for_last_check: datetime | None,
 ) -> tuple[datetime | None, datetime]:
-    """
-    Detects if there is an incoming call in Signal by checking the log file for
-    the "IncomingCall" notification. Returns True if an incoming call is detected
-    and it has not been answered yet.
+    """Find a not-yet-answered incoming-call notification in the Signal log.
+
+    Args:
+        last_answered_datetime: Timestamp of the most recently answered call.
+        final_line_datetime_for_last_check: Latest timestamp from the prior poll.
+
+    Returns:
+        The incoming-call timestamp when found, plus the latest log timestamp.
+
+    Raises:
+        ValueError: If answer history is provided without a prior poll timestamp.
     """
 
     with open(os.path.expanduser(SIGNAL_LOG_PATH), "r") as f:
@@ -191,10 +221,7 @@ def detect_incoming_call(
 
 
 def detect_terminated_call():
-    """
-    Detects if a call has been terminated in Signal by checking the log file for
-    the "CallTerminated" notification. Returns True if a call termination is detected.
-    """
+    """Return whether the Signal log contains an active-call termination event."""
     with open(os.path.expanduser(SIGNAL_LOG_PATH), "r") as f:
         lines = f.readlines()
 

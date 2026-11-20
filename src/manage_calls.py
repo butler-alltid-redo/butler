@@ -1,4 +1,5 @@
-import threading
+"""Monitor Signal logs and start the voice assistant for incoming calls."""
+
 import time
 
 from agent import agent
@@ -12,6 +13,7 @@ from signal_utils import (
 
 
 def monitor_call_termination():
+    """Placeholder monitor that returns when Signal reports call termination."""
     while True:
         if detect_terminated_call():
             print("Call terminated.")
@@ -20,6 +22,7 @@ def monitor_call_termination():
 
 
 def main():
+    """Poll Signal logs and answer incoming calls indefinitely."""
     last_answered_datetime = None
     final_line_datetime = get_last_log_line_datetime()  # Initialize final_line_datetime to the datetime of the last line in the log file upon startup
 

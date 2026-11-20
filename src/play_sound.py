@@ -1,11 +1,23 @@
+"""Utilities for converting generated audio into sounddevice-compatible arrays."""
+
 import numpy as np
-import sounddevice as sd
 import torch
 
 BLACKHOLE_DEVICE = "BlackHole 2ch"
 
 
 def to_sounddevice_audio(audio):
+    """Convert a torch tensor or NumPy array to clipped stereo float32 audio.
+
+    Mono, column-shaped mono, and already two-dimensional channel-major audio
+    are normalized to a two-column interleaved array suitable for PortAudio.
+
+    Args:
+        audio: TTS output as a torch tensor or NumPy array.
+
+    Returns:
+        A float32 NumPy array with shape ``(frames, 2)``.
+    """
     if isinstance(audio, torch.Tensor):
         arr = audio.detach().cpu().numpy()
     else:

@@ -1,3 +1,11 @@
+"""Real-time voice assistant orchestration.
+
+This module connects speech capture, speech-to-text, a streaming Pydantic AI
+agent, and text-to-speech.  The model stream is divided into sentence-sized
+chunks, while a separate worker generates and queues audio so LLM processing
+can continue without waiting for playback.
+"""
+
 import queue
 import re
 import threading
@@ -64,7 +72,15 @@ ollama_provider = OpenAICompatibleProvider(
 
 
 def split_stream_chunks(text: str, pending: str = "") -> tuple[list[str], str]:
-    """Split streamed text at periods, question marks, and exclamation marks."""
+    """Split delta text into complete punctuation-delimited speech chunks.
+
+    Args:
+        text: A newly received LLM text delta.
+        pending: Text waiting for a period, question mark, or exclamation mark.
+
+    Returns:
+        A pair containing complete chunks and the remaining unterminated text.
+    """
     pending += text
     chunks: list[str] = []
 
@@ -78,6 +94,7 @@ def split_stream_chunks(text: str, pending: str = "") -> tuple[list[str], str]:
 
 
 def speak(text: str) -> None:
+    """Queue text for synthesis without blocking the LLM stream."""
     tts_queue.put(text)
 
 
@@ -87,6 +104,11 @@ def playback_callback(
     _time,
     _status,
 ) -> None:
+    """Drain queued stereo audio into one PortAudio callback buffer.
+
+    The callback silently fills any remaining frames when synthesis or queued
+    audio is temporarily unavailable.  It never blocks the audio thread.
+    """
     global playback_audio
 
     outdata.fill(0)
@@ -118,6 +140,7 @@ def playback_callback(
 
 
 def tts_worker() -> None:
+    """Synthesize queued text and append its audio to the FIFO playback queue."""
     global playback_stream
 
     while (text := tts_queue.get()) is not None:
@@ -145,6 +168,15 @@ def tts_worker() -> None:
 
 
 def agent():
+    """Run the interactive voice-assistant loop until interrupted.
+
+    Captures utterances, transcribes them, streams LLM responses, and queues
+    punctuation-delimited text for TTS.  The loop retains Pydantic AI message
+    history across utterances.
+
+    Raises:
+        RuntimeError: If the configured BlackHole input device is unavailable.
+    """
     agent = Agent(
         OpenAIChatModel(OLLAMA_MODEL, provider=ollama_provider),
         instructions=AGENT_INSTRUCTIONS,

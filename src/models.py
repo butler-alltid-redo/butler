@@ -1,3 +1,5 @@
+"""Model loading and shared runtime configuration."""
+
 import torch
 from faster_whisper import WhisperModel
 from silero_vad import VADIterator, load_silero_vad
@@ -9,7 +11,13 @@ def load_whisper_model(
     device: str = "mps",
     compute_type: str = "float16",
 ) -> WhisperModel:
-    """Load the speech recognition model once for the process lifetime."""
+    """Load and configure a faster-whisper speech recognition model.
+
+    Args:
+        model_name: Hugging Face or faster-whisper model identifier.
+        device: Inference device, such as ``mps`` or ``cpu``.
+        compute_type: Whisper compute precision.
+    """
     print("Loading faster-whisper model...")
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
     print("Model loaded.")
@@ -21,7 +29,12 @@ def load_vad(
     target_rate: int,
     silence_duration_ms: int,
 ) -> VADIterator:
-    """Load Silero VAD once for the process lifetime."""
+    """Load Silero voice activity detection with sentence timing defaults.
+
+    Args:
+        target_rate: Audio sample rate consumed by the VAD.
+        silence_duration_ms: Silence duration that ends an active utterance.
+    """
     print("Loading Silero VAD...")
     torch.set_num_threads(1)
     vad = VADIterator(
@@ -41,12 +54,15 @@ import os
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 import mlx.core as mx
-from mlx_audio.audio_io import write as audio_write
 from mlx_audio.tts.utils import load_model
 
 
 def load_tts_model(model_name: str = "mlx-community/OmniVoice-bf16"):
-    """Load the TTS model once for the process lifetime."""
+    """Load an MLX text-to-speech model for the process lifetime.
+
+    Args:
+        model_name: Hugging Face model identifier available to MLX Audio.
+    """
     print("Loading TTS model...")
     model = load_model(model_name)  # ty: ignore[invalid-argument-type]
     print("TTS model loaded.")

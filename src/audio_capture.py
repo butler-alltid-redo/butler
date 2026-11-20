@@ -1,3 +1,5 @@
+"""VAD-based capture and resampling helpers for microphone audio."""
+
 import queue
 import threading
 
@@ -19,7 +21,20 @@ def capture_audio(
     pre_roll_chunks: int,
     max_utterance_seconds: int,
 ) -> None:
-    """Capture audio and queue completed speech utterances."""
+    """Capture speech until silence or the maximum utterance length is reached.
+
+    Args:
+        stream: A PyAudio input stream.
+        vad: A Silero VAD iterator that expects 16 kHz mono float samples.
+        audio_queue: Destination for completed utterances and a final ``None``.
+        stop_event: Signals the capture thread to stop.
+        source_rate: Sample rate produced by the PyAudio stream.
+        target_rate: Required VAD and Whisper sample rate.
+        channels: Number of channels in the PyAudio stream.
+        frames_per_read: Number of source frames read per loop iteration.
+        pre_roll_chunks: Number of recent chunks retained before speech begins.
+        max_utterance_seconds: Maximum duration of one captured utterance.
+    """
     pre_roll = []
     recording = []
     is_recording = False
@@ -58,7 +73,7 @@ def capture_audio(
                     is_recording = False
                     vad.reset_states()
 
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - audio backends vary and must not crash silently
         if not stop_event.is_set():
             print(f"Audio capture error: {error}")
     finally:
