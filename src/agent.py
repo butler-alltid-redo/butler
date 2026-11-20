@@ -208,6 +208,47 @@ def tts_worker() -> None:
         playback_done.set()
 
 
+def transcribe_utterance(audio_data: np.ndarray) -> str:
+    """Transcribe one utterance and recover from common transient Whisper failures.
+
+    Args:
+        audio_data: Resampled mono float32 audio at ``TARGET_RATE``.
+
+    Returns:
+        Transcribed Swedish text, or an empty string for unusable or failed audio.
+    """
+    if (
+        audio_data is None
+        or len(audio_data) < TARGET_RATE * 0.25
+        or not np.isfinite(audio_data).all()
+    ):
+        return ""
+
+    audio_data = np.ascontiguousarray(audio_data, dtype=np.float32)
+
+    for beam_size in (5, 1):
+        try:
+            segments, _ = whisper.transcribe(
+                audio_data,
+                beam_size=beam_size,
+                language="sv",
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            return " ".join(
+                segment.text.strip()
+                for segment in segments
+                if segment.text.strip()
+            )
+        except (IndexError, RuntimeError, ValueError) as error:
+            if beam_size == 5:
+                print(f"Whisper retry after transcription error: {error}")
+                continue
+            print(f"Whisper transcription failed: {error}")
+
+    return ""
+
+
 def stream_assistant_response(
     assistant: Agent,
     prompt: str,
@@ -359,16 +400,7 @@ def agent():
 
         while (audio_data := audio_queue.get()) is not None:
             print(f"\nRecording: {len(audio_data) / TARGET_RATE:.1f}s")
-
-            segments, _ = whisper.transcribe(
-                audio_data,
-                beam_size=5,
-                language="sv",
-                vad_filter=False,
-                condition_on_previous_text=False,
-            )
-
-            transcript = " ".join(s.text.strip() for s in segments if s.text.strip())
+            transcript = transcribe_utterance(audio_data)
             if not transcript:
                 continue
 
