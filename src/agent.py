@@ -32,7 +32,7 @@ from models import load_tts_model, load_vad, load_whisper_model
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "gemma4:e4b"
 AGENT_INSTRUCTIONS = """
-Du heter Butler. Du är en naturlig, kunnig och avslappnad svensk röstassistent. Svara kortfattat, vänligt och konversationsmässigt. Anpassa språket för tal, inte text. Undvik onödiga artighetsfraser, upprepningar och långa utläggningar. Använd aldrig emojis, markdown eller listformatering.
+Du heter Butler. Din ägare heter Sigge. Du är en naturlig, kunnig och avslappnad svensk röstassistent. Svara kortfattat, vänligt och konversationsmässigt. Anpassa språket för tal, inte text. Undvik onödiga artighetsfraser, upprepningar och långa utläggningar. Använd aldrig emojis, markdown eller listformatering.
 
 Använd gärna följande icke-verbala ljudtaggar när de passar naturligt i samtalet:
 [laughter], [sigh], [confirmation-en], [question-en], [question-ah], [question-oh], [question-ei], [question-yi], [surprise-ah], [surprise-oh], [surprise-wa], [surprise-yo], [dissatisfaction-hnn].
@@ -208,6 +208,71 @@ def tts_worker() -> None:
         playback_done.set()
 
 
+def stream_assistant_response(
+    assistant: Agent,
+    prompt: str,
+    conversation_history: list[ModelMessage] | None,
+    output_label: str,
+) -> list[ModelMessage] | None:
+    """Stream one agent response to text, TTS chunks, and message history.
+
+    Args:
+        assistant: Pydantic AI agent used for the response.
+        prompt: User prompt or generated session prompt.
+        conversation_history: Prior Pydantic AI messages, if any.
+        output_label: Console label printed before streamed text.
+
+    Returns:
+        Updated message history unless the response was interrupted.
+    """
+    global active_cancellation_token
+
+    interruption_event.clear()
+    cancellation_token = CancellationToken()
+
+    with active_cancellation_lock:
+        active_cancellation_token = cancellation_token
+
+    try:
+        with assistant.run_stream_sync(
+            prompt,
+            message_history=conversation_history,
+            cancellation_token=cancellation_token,
+        ) as result:
+            pending = ""
+            print(f"{output_label}: ", end="", flush=True)
+
+            for delta in result.stream_text(delta=True, debounce_by=None):
+                if interruption_event.is_set():
+                    break
+
+                print(delta, end="", flush=True)
+                chunks, pending = split_stream_chunks(delta, pending)
+
+                for chunk in chunks:
+                    if interruption_event.is_set():
+                        break
+                    speak(chunk)
+
+            if pending.strip() and not interruption_event.is_set():
+                speak(pending.strip())
+
+            print()
+            if not interruption_event.is_set():
+                return result.all_messages()
+
+    except RunCancelled:
+        print(f"\n{output_label} cancelled.")
+    except RuntimeError as error:
+        print(f"{output_label} error: {error}")
+    finally:
+        with active_cancellation_lock:
+            if active_cancellation_token is cancellation_token:
+                active_cancellation_token = None
+
+    return conversation_history
+
+
 def agent():
     """Run the interactive voice-assistant loop until interrupted.
 
@@ -224,6 +289,13 @@ def agent():
         model_settings={"extra_body": {"keep_alive": KEEP_ALIVE}},
     )
     conversation_history: list[ModelMessage] | None = None
+
+    greeting_prompt = (
+        "Säg ett kort, unikt och avslappnat hälsningsfras på svenska "
+        "som om du precis har svarat i telefon. Svara bara med själva hälsningen, "
+        "inte citattecken eller förklaringar. Du kan nämna ägarens namn Sigge om du vill. "
+        "Exempelvis 'Tjeeenare Sigge!', 'Butler speaking.', 'Hej Sigge, vad kan jag hjälpa dig med?', eller 'Hallå där!'."
+    )
 
     # Initialize audio
     audio = pyaudio.PyAudio()
@@ -278,6 +350,13 @@ def agent():
     try:
         print(f"Listening via {STT_INPUT_DEVICE} (device {input_device_index})...")
 
+        conversation_history = stream_assistant_response(
+            agent,
+            greeting_prompt,
+            conversation_history,
+            "Greeting",
+        )
+
         while (audio_data := audio_queue.get()) is not None:
             print(f"\nRecording: {len(audio_data) / TARGET_RATE:.1f}s")
 
@@ -295,45 +374,12 @@ def agent():
 
             print(f"You: {transcript}")
 
-            try:
-                interruption_event.clear()
-                cancellation_token = CancellationToken()
-                with active_cancellation_lock:
-                    active_cancellation_token = cancellation_token
-
-                with agent.run_stream_sync(
-                    transcript,
-                    message_history=conversation_history,
-                    cancellation_token=cancellation_token,
-                ) as result:
-                    pending = ""
-                    print("LLM: ", end="", flush=True)
-
-                    for delta in result.stream_text(delta=True, debounce_by=None):
-                        if interruption_event.is_set():
-                            break
-                        print(delta, end="", flush=True)
-                        chunks, pending = split_stream_chunks(delta, pending)
-                        for chunk in chunks:
-                            if interruption_event.is_set():
-                                break
-                            speak(chunk)
-
-                    if pending.strip() and not interruption_event.is_set():
-                        speak(pending.strip())
-
-                    print()
-                    if not interruption_event.is_set():
-                        conversation_history = result.all_messages()
-
-            except RunCancelled:
-                print("\nLLM generation cancelled.")
-            except RuntimeError as e:
-                print(f"Assistant error: {e}")
-            finally:
-                with active_cancellation_lock:
-                    if active_cancellation_token is cancellation_token:
-                        active_cancellation_token = None
+            conversation_history = stream_assistant_response(
+                agent,
+                transcript,
+                conversation_history,
+                "LLM",
+            )
 
     except KeyboardInterrupt:
         print("\nStopping...")
