@@ -1,7 +1,8 @@
-import atexit
 import queue
+import re
 import threading
 
+import numpy as np
 import pyaudio
 import pydantic_ai
 
@@ -41,6 +42,12 @@ KEEP_ALIVE = "240h"
 
 # TTS
 TTS_OUTPUT_DEVICE = "BlackHole 2ch"
+CHUNK_PUNCTUATION = re.compile(r"[.!?]")
+tts_queue: queue.Queue[str | None] = queue.Queue()
+playback_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+playback_done = threading.Event()
+playback_stream: sd.OutputStream | None = None
+playback_audio: np.ndarray | None = None
 
 # Initialize models and clients
 whisper = load_whisper_model()
@@ -54,6 +61,87 @@ ollama_provider = OpenAICompatibleProvider(
     base_url=f"{OLLAMA_URL}/v1",
     api_key="ollama",
 )
+
+
+def split_stream_chunks(text: str, pending: str = "") -> tuple[list[str], str]:
+    """Split streamed text at periods, question marks, and exclamation marks."""
+    pending += text
+    chunks: list[str] = []
+
+    while match := CHUNK_PUNCTUATION.search(pending):
+        chunk = pending[: match.end()].strip()
+        pending = pending[match.end() :].lstrip()
+        if chunk:
+            chunks.append(chunk)
+
+    return chunks, pending
+
+
+def speak(text: str) -> None:
+    tts_queue.put(text)
+
+
+def playback_callback(
+    outdata: np.ndarray,
+    frames: int,
+    _time,
+    _status,
+) -> None:
+    global playback_audio
+
+    outdata.fill(0)
+    written = 0
+
+    while written < frames:
+        if playback_audio is None:
+            try:
+                playback_audio = playback_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if playback_audio is None:
+                playback_done.set()
+                playback_audio = None
+                break
+
+        remaining = frames - written
+        available = len(playback_audio) - 0
+        count = min(remaining, available)
+        outdata[written : written + count] = playback_audio[:count]
+
+        if count == len(playback_audio):
+            playback_audio = None
+        else:
+            playback_audio = playback_audio[count:]
+
+        written += count
+
+
+def tts_worker() -> None:
+    global playback_stream
+
+    while (text := tts_queue.get()) is not None:
+        for result in tts_model.generate(
+            text=text,
+            ref_audio="gago.wav",
+            ref_text="Jag kommer aldrig att glömma hur det ojämna jordgolvet skavde mot mina bara knän.",
+        ):
+            samples = to_sounddevice_audio(result.audio)
+            if playback_stream is None:
+                playback_stream = sd.OutputStream(
+                    samplerate=result.sample_rate,
+                    channels=2,
+                    dtype=np.float32,
+                    device=TTS_OUTPUT_DEVICE,
+                    callback=playback_callback,
+                )
+                playback_stream.start()
+            playback_queue.put(samples)
+        tts_queue.task_done()
+
+    playback_queue.put(None)
+    if playback_stream is None:
+        playback_done.set()
 
 
 def agent():
@@ -109,6 +197,8 @@ def agent():
     )
 
     capture_thread.start()
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
 
     try:
         print(f"Listening via {STT_INPUT_DEVICE} (device {input_device_index})...")
@@ -131,28 +221,24 @@ def agent():
             print(f"You: {transcript}")
 
             try:
-                result = agent.run_sync(
+                with agent.run_stream_sync(
                     transcript,
                     message_history=conversation_history,
-                )
-                response = result.output
-                conversation_history = result.all_messages()
-                print(f"LLM: {response}")
-                for i, result in enumerate(
-                    tts_model.generate(
-                        text=response,
-                        # language="sv",
-                        # duration_s=8.0,
-                        # num_steps=32,
-                        ref_audio="../gago.wav",
-                        ref_text="Jag kommer aldrig att glömma hur det ojämna jordgolvet skavde mot mina bara knän.",
-                    )
-                ):
-                    samples = to_sounddevice_audio(result.audio)
-                    sd.play(
-                        samples, samplerate=result.sample_rate, device=TTS_OUTPUT_DEVICE
-                    )
-                    sd.wait()  # Wait until playback finishes before generating/playing the next chunk
+                ) as result:
+                    pending = ""
+                    print("LLM: ", end="", flush=True)
+
+                    for delta in result.stream_text(delta=True, debounce_by=None):
+                        print(delta, end="", flush=True)
+                        chunks, pending = split_stream_chunks(delta, pending)
+                        for chunk in chunks:
+                            speak(chunk)
+
+                    if pending.strip():
+                        speak(pending.strip())
+
+                    print()
+                    conversation_history = result.all_messages()
 
             except RuntimeError as e:
                 print(f"Assistant error: {e}")
@@ -163,6 +249,13 @@ def agent():
     finally:
         stop_event.set()
         capture_thread.join(timeout=3)
+        tts_queue.put(None)
+        tts_thread.join()
+        playback_done.wait(timeout=30)
+
+        if playback_stream is not None:
+            playback_stream.stop()
+            playback_stream.close()
 
         if stream.is_active():
             stream.stop_stream()
