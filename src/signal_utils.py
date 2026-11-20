@@ -86,6 +86,15 @@ def make_call():
     time.sleep(1.0)
 
     x, y, w, h = get_signal_window_bounds()
+
+    # Click the "X" button to close the call quality service window if it appears
+    close_x = x + (w * 0.71)
+    close_y = y + (h * 0.37)
+    hardware_click(close_x, close_y)
+
+    time.sleep(0.5)  # Wait for the call window to be ready
+
+    # Click the "Call" button in the call window
     start_x = x + (w * 0.74)
     start_y = y + (h * 0.92)
     hardware_click(start_x, start_y)
