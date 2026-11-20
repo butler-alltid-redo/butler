@@ -19,7 +19,8 @@ from play_sound import to_sounddevice_audio
 pydantic_ai.BANNER_ENABLED = False  # ty: ignore[invalid-assignment]
 
 import sounddevice as sd
-from pydantic_ai import Agent
+from pydantic_ai import Agent, CancellationToken
+from pydantic_ai.exceptions import RunCancelled
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai_compatible import OpenAICompatibleProvider
@@ -31,7 +32,7 @@ from models import load_tts_model, load_vad, load_whisper_model
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "gemma4:e4b"
 AGENT_INSTRUCTIONS = """
-Du är en naturlig, kunnig och avslappnad svensk röstassistent. Svara kortfattat, vänligt och konversationsmässigt. Anpassa språket för tal, inte text. Undvik onödiga artighetsfraser, upprepningar och långa utläggningar. Använd aldrig emojis, markdown eller listformatering.
+Du heter Butler. Du är en naturlig, kunnig och avslappnad svensk röstassistent. Svara kortfattat, vänligt och konversationsmässigt. Anpassa språket för tal, inte text. Undvik onödiga artighetsfraser, upprepningar och långa utläggningar. Använd aldrig emojis, markdown eller listformatering.
 
 Använd gärna följande icke-verbala ljudtaggar när de passar naturligt i samtalet:
 [laughter], [sigh], [confirmation-en], [question-en], [question-ah], [question-oh], [question-ei], [question-yi], [surprise-ah], [surprise-oh], [surprise-wa], [surprise-yo], [dissatisfaction-hnn].
@@ -56,6 +57,11 @@ playback_queue: queue.Queue[np.ndarray | None] = queue.Queue()
 playback_done = threading.Event()
 playback_stream: sd.OutputStream | None = None
 playback_audio: np.ndarray | None = None
+playback_lock = threading.Lock()
+interruption_event = threading.Event()
+active_cancellation_lock = threading.Lock()
+active_cancellation_token: CancellationToken | None = None
+tts_generation = 0
 
 # Initialize models and clients
 whisper = load_whisper_model()
@@ -95,7 +101,33 @@ def split_stream_chunks(text: str, pending: str = "") -> tuple[list[str], str]:
 
 def speak(text: str) -> None:
     """Queue text for synthesis without blocking the LLM stream."""
-    tts_queue.put(text)
+    if not interruption_event.is_set():
+        tts_queue.put(text)
+
+
+def clear_queue(item_queue: queue.Queue) -> None:
+    """Remove queued work without blocking the worker or audio callback."""
+    with item_queue.mutex:
+        item_queue.queue.clear()
+
+
+def interrupt_assistant() -> None:
+    """Cancel active LLM generation and discard all pending TTS/playback."""
+    global playback_audio, tts_generation
+
+    interruption_event.set()
+    tts_generation += 1
+    clear_queue(tts_queue)
+    clear_queue(playback_queue)
+
+    with playback_lock:
+        playback_audio = None
+
+    with active_cancellation_lock:
+        token = active_cancellation_token
+
+    if token is not None and not token.cancelled:
+        token.cancel()
 
 
 def playback_callback(
@@ -111,32 +143,33 @@ def playback_callback(
     """
     global playback_audio
 
-    outdata.fill(0)
-    written = 0
+    with playback_lock:
+        outdata.fill(0)
+        written = 0
 
-    while written < frames:
-        if playback_audio is None:
-            try:
-                playback_audio = playback_queue.get_nowait()
-            except queue.Empty:
-                break
-
+        while written < frames:
             if playback_audio is None:
-                playback_done.set()
+                try:
+                    playback_audio = playback_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if playback_audio is None:
+                    playback_done.set()
+                    playback_audio = None
+                    break
+
+            remaining = frames - written
+            available = len(playback_audio) - 0
+            count = min(remaining, available)
+            outdata[written : written + count] = playback_audio[:count]
+
+            if count == len(playback_audio):
                 playback_audio = None
-                break
+            else:
+                playback_audio = playback_audio[count:]
 
-        remaining = frames - written
-        available = len(playback_audio) - 0
-        count = min(remaining, available)
-        outdata[written : written + count] = playback_audio[:count]
-
-        if count == len(playback_audio):
-            playback_audio = None
-        else:
-            playback_audio = playback_audio[count:]
-
-        written += count
+            written += count
 
 
 def tts_worker() -> None:
@@ -144,11 +177,14 @@ def tts_worker() -> None:
     global playback_stream
 
     while (text := tts_queue.get()) is not None:
+        generation = tts_generation
         for result in tts_model.generate(
             text=text,
             ref_audio="gago.wav",
             ref_text="Jag kommer aldrig att glömma hur det ojämna jordgolvet skavde mot mina bara knän.",
         ):
+            if generation != tts_generation:
+                break
             samples = to_sounddevice_audio(result.audio)
             if playback_stream is None:
                 playback_stream = sd.OutputStream(
@@ -224,6 +260,7 @@ def agent():
             "frames_per_read": FRAMES_PER_READ,
             "pre_roll_chunks": PRE_ROLL,
             "max_utterance_seconds": MAX_UTTERANCE,
+            "on_speech_start": interrupt_assistant,
         },
         daemon=True,
     )
@@ -253,27 +290,44 @@ def agent():
             print(f"You: {transcript}")
 
             try:
+                interruption_event.clear()
+                cancellation_token = CancellationToken()
+                with active_cancellation_lock:
+                    active_cancellation_token = cancellation_token
+
                 with agent.run_stream_sync(
                     transcript,
                     message_history=conversation_history,
+                    cancellation_token=cancellation_token,
                 ) as result:
                     pending = ""
                     print("LLM: ", end="", flush=True)
 
                     for delta in result.stream_text(delta=True, debounce_by=None):
+                        if interruption_event.is_set():
+                            break
                         print(delta, end="", flush=True)
                         chunks, pending = split_stream_chunks(delta, pending)
                         for chunk in chunks:
+                            if interruption_event.is_set():
+                                break
                             speak(chunk)
 
-                    if pending.strip():
+                    if pending.strip() and not interruption_event.is_set():
                         speak(pending.strip())
 
                     print()
-                    conversation_history = result.all_messages()
+                    if not interruption_event.is_set():
+                        conversation_history = result.all_messages()
 
+            except RunCancelled:
+                print("\nLLM generation cancelled.")
             except RuntimeError as e:
                 print(f"Assistant error: {e}")
+            finally:
+                with active_cancellation_lock:
+                    if active_cancellation_token is cancellation_token:
+                        active_cancellation_token = None
 
     except KeyboardInterrupt:
         print("\nStopping...")

@@ -2,6 +2,7 @@
 
 import queue
 import threading
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ def capture_audio(
     frames_per_read: int,
     pre_roll_chunks: int,
     max_utterance_seconds: int,
+    on_speech_start: Callable[[], None] | None = None,
 ) -> None:
     """Capture speech until silence or the maximum utterance length is reached.
 
@@ -34,6 +36,7 @@ def capture_audio(
         frames_per_read: Number of source frames read per loop iteration.
         pre_roll_chunks: Number of recent chunks retained before speech begins.
         max_utterance_seconds: Maximum duration of one captured utterance.
+        on_speech_start: Optional callback invoked immediately when VAD detects speech.
     """
     pre_roll = []
     recording = []
@@ -59,6 +62,8 @@ def capture_audio(
 
                 if event and "start" in event:
                     print("\nSpeech detected...")
+                    if on_speech_start is not None:
+                        on_speech_start()
                     recording = pre_roll.copy()
                     pre_roll.clear()
                     is_recording = True
