@@ -254,6 +254,7 @@ def stream_assistant_response(
     prompt: str,
     conversation_history: list[ModelMessage] | None,
     output_label: str,
+    stop_event: threading.Event | None = None,
 ) -> list[ModelMessage] | None:
     """Stream one agent response to text, TTS chunks, and message history.
 
@@ -284,22 +285,34 @@ def stream_assistant_response(
             print(f"{output_label}: ", end="", flush=True)
 
             for delta in result.stream_text(delta=True, debounce_by=None):
-                if interruption_event.is_set():
+                if interruption_event.is_set() or (
+                    stop_event is not None and stop_event.is_set()
+                ):
+                    if stop_event is not None and stop_event.is_set():
+                        cancellation_token.cancel()
                     break
 
                 print(delta, end="", flush=True)
                 chunks, pending = split_stream_chunks(delta, pending)
 
                 for chunk in chunks:
-                    if interruption_event.is_set():
+                    if interruption_event.is_set() or (
+                        stop_event is not None and stop_event.is_set()
+                    ):
                         break
                     speak(chunk)
 
-            if pending.strip() and not interruption_event.is_set():
+            if (
+                pending.strip()
+                and not interruption_event.is_set()
+                and not (stop_event is not None and stop_event.is_set())
+            ):
                 speak(pending.strip())
 
             print()
-            if not interruption_event.is_set():
+            if not interruption_event.is_set() and not (
+                stop_event is not None and stop_event.is_set()
+            ):
                 return result.all_messages()
 
     except RunCancelled:
@@ -314,16 +327,22 @@ def stream_assistant_response(
     return conversation_history
 
 
-def agent():
+def agent(stop_event: threading.Event | None = None):
     """Run the interactive voice-assistant loop until interrupted.
 
     Captures utterances, transcribes them, streams LLM responses, and queues
     punctuation-delimited text for TTS.  The loop retains Pydantic AI message
     history across utterances.
 
+    Args:
+        stop_event: Optional event set when the active call terminates.
+
     Raises:
         RuntimeError: If the configured BlackHole input device is unavailable.
     """
+    if stop_event is None:
+        stop_event = threading.Event()
+
     agent = Agent(
         OpenAIChatModel(OLLAMA_MODEL, provider=ollama_provider),
         instructions=AGENT_INSTRUCTIONS,
@@ -396,9 +415,16 @@ def agent():
             greeting_prompt,
             conversation_history,
             "Greeting",
+            stop_event,
         )
 
-        while (audio_data := audio_queue.get()) is not None:
+        while not stop_event.is_set():
+            try:
+                audio_data = audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if audio_data is None:
+                break
             print(f"\nRecording: {len(audio_data) / TARGET_RATE:.1f}s")
             transcript = transcribe_utterance(audio_data)
             if not transcript:
@@ -411,6 +437,7 @@ def agent():
                 transcript,
                 conversation_history,
                 "LLM",
+                stop_event,
             )
 
     except KeyboardInterrupt:

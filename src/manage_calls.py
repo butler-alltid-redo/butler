@@ -1,8 +1,9 @@
 """Monitor Signal logs and start the voice assistant for incoming calls."""
 
+import threading
 import time
 
-from agent import agent
+from agent import agent, interrupt_assistant
 from signal_utils import (
     answer_call,
     clear_log_file,
@@ -12,11 +13,16 @@ from signal_utils import (
 )
 
 
-def monitor_call_termination():
-    """Placeholder monitor that returns when Signal reports call termination."""
-    while True:
+def monitor_call_termination(stop_event=None):
+    """Stop the active agent when Signal reports call termination."""
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    while not stop_event.is_set():
         if detect_terminated_call():
             print("Call terminated.")
+            stop_event.set()
+            interrupt_assistant()
             return
         time.sleep(1)
 
@@ -40,15 +46,16 @@ def main():
             print("Call answered. Log file cleared.")
             last_answered_datetime = answered_datetime
 
-            # TODO If call is terminated, stop the agent and return to monitoring for incoming calls.
-            # termination_thread = threading.Thread(
-            #     target=monitor_call_termination,
-            #     name="call-termination-monitor",
-            #     daemon=True,
-            # )
-            # termination_thread.start()
+            stop_event = threading.Event()
+            termination_thread = threading.Thread(
+                target=monitor_call_termination,
+                args=(stop_event,),
+                name="call-termination-monitor",
+                daemon=True,
+            )
+            termination_thread.start()
 
-            agent()
+            agent(stop_event)
 
         time.sleep(1)
 
